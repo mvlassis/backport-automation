@@ -1,0 +1,170 @@
+name: Backport to track/1.0
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Commit to backport (defaults to the branch tip)
+        required: false
+        type: string
+      before_sha:
+        description: Backport everything after this commit (optional)
+        required: false
+        type: string
+
+concurrency:
+  group: backport-track-1.0
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+env:
+  TARGET_BRANCH: track/1.0
+  CHERRY_PICK_LOG: /tmp/cherry-pick.log
+  COPILOT_LOG: /tmp/copilot.log
+
+jobs:
+  backport:
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      !contains(github.event.head_commit.message, '[skip backport]')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.COPILOT_CLI_TOKEN }}
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      # Normalises push and workflow_dispatch into a single pair of shas so the
+      # rest of the job is trigger-agnostic.
+      - name: Resolve event shas
+        id: event
+        run: |
+          after="${{ github.event.inputs.sha || github.event.after }}"
+          before="${{ github.event.inputs.before_sha || github.event.before }}"
+          if [ -z "$after" ]; then
+            after="$(git rev-parse HEAD)"
+          fi
+          if [ -z "$before" ]; then
+            before="0000000000000000000000000000000000000000"
+          fi
+          echo "after=$(git rev-parse "$after")" >> "$GITHUB_OUTPUT"
+          echo "before=${before}" >> "$GITHUB_OUTPUT"
+
+      - name: Check target branch exists
+        id: target
+        run: .github/scripts/backport.sh target-exists
+
+      - name: Resolve commits to backport
+        id: commits
+        if: steps.target.outputs.exists == 'true'
+        env:
+          BEFORE_SHA: ${{ steps.event.outputs.before }}
+          AFTER_SHA: ${{ steps.event.outputs.after }}
+        run: .github/scripts/backport.sh resolve-commits
+
+      - name: Prepare backport branch
+        id: branch
+        if: steps.target.outputs.exists == 'true' && steps.commits.outputs.shas != ''
+        env:
+          AFTER_SHA: ${{ steps.event.outputs.after }}
+        run: .github/scripts/backport.sh prepare-branch
+
+      - name: Attempt cherry-pick
+        id: pick
+        if: steps.branch.outputs.name != ''
+        env:
+          SHAS: ${{ steps.commits.outputs.shas }}
+        run: printf '%s\n' "$SHAS" | .github/scripts/backport.sh cherry-pick
+
+      - name: Install Copilot CLI
+        if: steps.pick.outputs.conflict == 'true'
+        run: npm install -g @github/copilot
+
+      - name: Resolve conflicts with Copilot
+        id: copilot
+        if: steps.pick.outputs.conflict == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.COPILOT_CLI_TOKEN }}
+          XDG_CONFIG_HOME: ${{ runner.temp }}/copilot-config
+          CONFLICT_SHA: ${{ steps.pick.outputs.conflict_sha }}
+        run: |
+          mkdir -p "$XDG_CONFIG_HOME"
+          prompt="$(.github/scripts/backport.sh prompt "$CONFLICT_SHA")"
+          copilot --allow-all-tools --log-level none -p "$prompt" 2>&1 \
+            | tee "$COPILOT_LOG"
+
+      - name: Verify resolution
+        id: verify
+        if: steps.branch.outputs.name != ''
+        run: .github/scripts/backport.sh verify
+
+      - name: Push and open pull request
+        if: steps.verify.outputs.ok == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.COPILOT_CLI_TOKEN }}
+          BRANCH: ${{ steps.branch.outputs.name }}
+          AFTER_SHA: ${{ steps.event.outputs.after }}
+          CONFLICTED: ${{ steps.pick.outputs.conflict }}
+        run: |
+          subject="$(git log -1 --format=%s "$AFTER_SHA")"
+          git push --force-with-lease origin "HEAD:${BRANCH}"
+
+          if [ "$CONFLICTED" = "true" ]; then
+            note="The cherry-pick hit conflicts and was resolved by the Copilot CLI. **Please review the diff carefully.**"
+            labels="backport,copilot-assisted,needs-review"
+          else
+            note="The cherry-pick applied cleanly."
+            labels="backport"
+          fi
+
+          # shellcheck disable=SC2016  # backticks are markdown, not substitution
+          body="$(printf 'Automated backport of %s to `%s`.\n\n> %s\n\n%s\n' \
+            "$AFTER_SHA" "$TARGET_BRANCH" "$subject" "$note")"
+
+          # No unlabelled fallback: a missing label must fail loudly rather than
+          # silently dropping the needs-review signal from a Copilot-authored PR.
+          gh pr create \
+            --base "$TARGET_BRANCH" \
+            --head "$BRANCH" \
+            --title "[${TARGET_BRANCH}] ${subject}" \
+            --body "$body" \
+            --label "$labels"
+
+      - name: Report failure
+        if: steps.verify.outputs.ok == 'false' && steps.verify.outputs.empty != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.COPILOT_CLI_TOKEN }}
+          AFTER_SHA: ${{ steps.event.outputs.after }}
+        run: |
+          subject="$(git log -1 --format=%s "$AFTER_SHA")"
+          author="$(git log -1 --format=%an "$AFTER_SHA")"
+
+          # shellcheck disable=SC2016  # backticks are markdown, not substitution
+          body="$(printf 'The automated backport of %s ("%s") by %s to `%s` failed.\n\n### Cherry-pick output\n\n```\n%s\n```\n\n### Copilot output\n\n```\n%s\n```\n\n[Workflow run](%s/%s/actions/runs/%s)\n' \
+            "$AFTER_SHA" "$subject" "$author" "$TARGET_BRANCH" \
+            "$(tail -n 100 "$CHERRY_PICK_LOG" 2>/dev/null)" \
+            "$(tail -n 100 "$COPILOT_LOG" 2>/dev/null)" \
+            "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")"
+
+          gh issue create \
+            --title "Backport of ${AFTER_SHA} to ${TARGET_BRANCH} failed" \
+            --body "$body"
+
+          exit 1
