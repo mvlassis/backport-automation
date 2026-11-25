@@ -20,4 +20,7 @@ jobs:
     name: Backport pull request
     if: github.event.pull_request.merged
     uses: canonical/charmed-kubeflow-workflows/.github/workflows/backport-pr.yaml@main
-    secrets: inherit
+    secrets:
+      GH_TOKEN: ${{ secrets.GH_TOKEN }}
+      GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+      GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
